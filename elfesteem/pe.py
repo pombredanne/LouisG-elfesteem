@@ -6,7 +6,7 @@ from elfesteem.cstruct import bytes_to_name, name_to_bytes
 from elfesteem.strpatchwork import StrPatchwork
 import struct
 import logging
-log = logging.getLogger("pepy")
+log = logging.getLogger("pe")
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter("%(levelname)-5s: %(message)s"))
 log.addHandler(console_handler)
@@ -508,6 +508,8 @@ class DOShdr(CStruct):
 
 class NTsig(CStruct):
     _fields = [ ("signature","u32") ]
+    # Needed for miasm2/analysis/binary.py
+    signature_value = property(lambda _:_.signature)
 
 class COFFhdr(CStruct):
     _fields = [ ("machine","u16"),
@@ -684,16 +686,7 @@ class OptNThdr(CStruct):
 
 class OptNThdrs(CArray):
     _cls = OptNThdr
-    def count(self):
-        numberofrva = self.parent.numberofrvaandsizes
-        pefile = self.parent.parent
-        sizeofrva = pefile.COFFhdr.sizeofoptionalheader - pefile.Opthdr.bytelen
-        size_e = 8
-        if sizeofrva < numberofrva * size_e:
-            numberofrva = sizeofrva // size_e
-            log.warn('Bad number of rva %#x: using default 0x10', numberofrva)
-            numberofrva = 0x10
-        return numberofrva
+    count = lambda _: _.parent.numberofrvaandsizes
 
 class NThdr(CStruct):
     _fields = [ ("ImageBase","ptr"),
@@ -720,6 +713,12 @@ class NThdr(CStruct):
                 ("optentries",OptNThdrs) ]
     def get_optentries(self):
         return self.getf('optentries')._array
+    def unpack(self, c, o):
+        CStruct.unpack(self, c, o)
+        sz_opt = self.parent.COFFhdr.sizeofoptionalheader
+        if sz_opt != self.parent.Opthdr.bytelen + self.bytelen:
+            log.warn('Number of rva %d does not match sizeofoptionalheader %d',
+                self.numberofrvaandsizes, sz_opt)
 
 ####################################################################
 # Sections
@@ -741,23 +740,19 @@ class SectionData(CBase):
             filealignment = pefile.NThdr.filealignment
         else:
             filealignment = 0
-        if pefile.loadfrommem:
-            raw_off = self.parent.vaddr
-        elif filealignment == 0:
-            raw_off = self.parent.scnptr
-        else:
-            raw_off = filealignment*(self.parent.scnptr//filealignment)
-        if raw_off != self.parent.scnptr:
-            log.warn('unaligned raw section!')
         self.data = StrPatchwork()
-        rs = self.parent.rsize
-        if rs != 0 and filealignment != 0:
-            if rs % filealignment:
-                rs = (rs//filealignment+1)*filealignment
-            rs = max(rs, 0x200)
-        if raw_off+rs > len(c):
-            rs = len(c) - raw_off
-        self.data[0] = c[raw_off:raw_off+rs]
+        if filealignment != 0:
+            if self.parent.scnptr % filealignment:
+                log.warn('Section %d offset %#x not aligned to %#x',
+                    len(self.parent.parent), self.parent.scnptr, filealignment)
+            if self.parent.rsize % filealignment:
+                log.warn('Section %d size %#x not aligned to %#x',
+                    len(self.parent.parent), self.parent.rsize, filealignment)
+        raw_sz = self.parent.rsize
+        raw_sz += self.parent.scnptr - self.parent.scn_baseoff
+        if self.parent.scn_baseoff+raw_sz > len(c):
+            raw_sz = len(c) - self.parent.scn_baseoff
+        self.data[0] = c[self.parent.scn_baseoff:self.parent.scn_baseoff+raw_sz]
         self.relocs = COFFRelocations(parent=self.parent,
                                       content=c,
                                       start=self.parent.relptr)
@@ -769,6 +764,10 @@ class SectionData(CBase):
         return self.data.__getitem__(item)
     def __setitem__(self, item, value):
         return self.data.__setitem__(item, value)
+    def find(self, pattern, *args):
+        return self.data.find(pattern, *args)
+    def rfind(self, pattern, *args):
+        return self.data.rfind(pattern, *args)
 
 class COFFRelocation(CStruct):
     _fields = [ ("VirtualAddress","u32"),
@@ -816,7 +815,7 @@ class Shdr(CStruct):
                 ("nreloc","u16"),  # was named 'numberofrelocations'
                 ("nlnno","u16"),   # was named 'numberoflinenumbers'
                 ("flags","u32"),
-                ("data",SectionData) ]
+                ("section_data",SectionData) ]
     def name(self):
         # Offset in the string table, if more than 8 bytes long
         n = self.name_data
@@ -827,15 +826,52 @@ class Shdr(CStruct):
             n = n.rstrip(data_null)
         return bytes_to_name(n)
     name = property(name)
-    # For API compatibility with previous versions of elfesteem
-    rawsize = property(lambda self: self.rsize)
-    offset  = property(lambda self: self.scnptr)
-    addr    = property(lambda self: self.vaddr)
+    def scn_baseoff(self):
+        if not self.parent.parent.isPE():
+            return self.scnptr
+        # The conversion from RVA to file offset is dependent on
+        # the file alignment. Instead of 'scnptr', PE.rva2off
+        # will use this 'scn_baseoff' value.
+        filealignment = self.parent.parent.NThdr.filealignment
+        if not filealignment:
+            return self.scnptr
+        # The following hack is what is needed to parse Ange
+        # Albertini's weirdsord.exe, which defines FILEALIGN
+        # to 0x4000 and then DELTA with an offset of 0x200, while
+        # the section starts at 0x201. It suggests that Windows
+        # always use an alignment of 0x200 independently of what
+        # is in the NT header...
+        filealignment = 0x200
+        return (self.scnptr//filealignment)*filealignment
+    scn_baseoff = property(scn_baseoff)
+    def is_in_file(self):
+        if self.rsize == 0:
+            # Empty section, not in the file!
+            return False
+        if self.flags & (STYP_BSS|STYP_SBSS|STYP_DSECT):
+            # bss/dummy section, not in the file!
+            return False
+        return True
+    # For API compatibility with previous versions of elfesteem,
+    # especially miasm2/jitter/loader/pe.py
+    def set_rawsize(self, v):
+        self.rsize = v
+    rawsize = property(lambda _: _.rsize, set_rawsize)
+    def set_offset(self, v):
+        self.scnptr = v
+    offset  = property(lambda _: _.scnptr, set_offset)
+    addr    = property(lambda _: _.vaddr)
     def size(self):
         # Return the virtual size (for PE) or the RAW size (for COFF)
         if self.parent.parent.isPE(): return self.paddr
         else:                         return self.rawsize
-    size    = property(size)
+    def set_size(self, value):
+        if self.parent.parent.isPE(): self.paddr = value
+        else:                         self.rawsize = value
+    size    = property(size, set_size)
+    def set_data(self, value):
+        self.section_data.data = value
+    data    = property(lambda _: _.section_data.data, set_data)
 
 class ShdrTI(Shdr):
     # 48 bytes long, when the standard COFF is 40 bytes long
@@ -876,30 +912,33 @@ class SHList(CArray):
     def shlist(self):
         return self._array
     shlist = property(shlist)
-    def __repr__(self):
-        rep = ["#  section         scnptr   size   vaddr     flags   paddr  "]
+    def display(self):
+        rep = ["#  section         offset   size   addr     flags   rawsize  "]
         for i, s in enumerate(self):
             l = "%-15s"%s.name.strip('\x00')
-            l+="%(scnptr)08x %(size)06x %(vaddr)08x %(flags)08x %(paddr)08x" % s
+            l+="%(offset)08x %(size)06x %(vaddr)08x %(flags)08x %(rawsize)08x" % s
             l = ("%2i " % i)+ l
             rep.append(l)
         return "\n".join(rep)
+    def __repr__(self):
+        # Not respecting python's recommendation of what __repr__ should return
+        return self.display()
     
     def add_section(self, name="default", data = data_empty, **args):
         if len(self):
             # Check that there is enough free space in the headers
             # to add a new section
-            first_section_offset = 0
+            min_size = (self.parent.DOShdr.lfanew +
+                        self.parent.NTsig.bytelen +
+                        self.parent.COFFhdr.bytelen +
+                        self.parent.COFFhdr.sizeofoptionalheader +
+                        (1+len(self))*Shdr(parent=self).bytelen)
+            first_section_offset = min_size
             for s in self.parent.SHList:
-                if first_section_offset < s.scnptr:
+                if s.is_in_file() and first_section_offset > s.scnptr:
                     first_section_offset = s.scnptr
             # Should be equal to self.parent.NThdr.sizeofheaders
-            if first_section_offset < (
-                    self.parent.DOShdr.lfanew +
-                    self.parent.NTsig.bytelen +
-                    self.parent.COFFhdr.bytelen +
-                    self.parent.COFFhdr.sizeofoptionalheader +
-                    (1+len(self))*Shdr(parent=self).bytelen):
+            if first_section_offset < min_size:
                 log.error("Cannot add section %s: not enough space for section list", name)
                 # Could be solved by changing the section offsets, but some
                 # sections may contain data that depends on the offset.
@@ -934,9 +973,10 @@ class SHList(CArray):
         vaddr = (vaddr+(s_align-1))&~(s_align-1)
         scnptr = (scnptr+(f_align-1))&~(f_align-1)
     
-        name += (8-len(name))*data_null
+        # 'name' is a string, 'name_data' is a sequence of bytes
+        name_data = name.encode('latin1') + (8-len(name))*data_null
         rsize = (len(data)+(f_align-1))&~(f_align-1)
-        f = {"name_data":name,
+        f = {"name_data":name_data,
              "paddr":len(data), # was named 'size'
              "vaddr":vaddr,     # was named 'addr'
              "rsize":rsize,     # was named 'rawsize'
@@ -955,7 +995,14 @@ class SHList(CArray):
             # In PE file, paddr usually contains the size of the non-padded data
             s.paddr = len(data)
             data = data+data_null*(s.rawsize-len(data))
-        s.data = SectionData(parent=s, data=data)
+        if 'rawsize' in args:
+            # When created with the old elfesteem API
+            s.rsize = args['rawsize']
+            s.paddr = args['rawsize']
+        if 'size' in args:
+            # When created with the old elfesteem API
+            s.paddr = args['size']
+        s.section_data = SectionData(parent=s, data=data)
     
         self.append(s)
         self.parent.COFFhdr.numberofsections = len(self)
@@ -963,6 +1010,22 @@ class SHList(CArray):
         l = (s.vaddr+s.rawsize+(s_align-1))&~(s_align-1)
         self.parent.NThdr.sizeofimage = l
         return s
+    
+    def align_sections(self, f_align=None, s_align=None):
+        if f_align == None:
+            f_align = self.parent.NThdr.filealignment
+            f_align = max(0x200, f_align)
+        if s_align == None:
+            s_align = self.parent.NThdr.sectionalignment
+            s_align = max(0x1000, s_align)
+        addr = self[0].offset
+        for s in self:
+            if not s.is_in_file():
+                continue
+            raw_off = f_align * ((addr + f_align - 1) // f_align)
+            s.offset = raw_off
+            s.rawsize = len(s.data)
+            addr = raw_off + s.rawsize
 
 
 ####################################################################
@@ -970,9 +1033,9 @@ class SHList(CArray):
 
 # Parsing a Directory is not complicated, it is a tree-like structure
 # where RVA are pointers to be converted in offsets in the file.
-# Modifying a Directory makes is more complicated.
+# Modifying a Directory is more complicated.
 # - It is not always entirely in one section; e.g. for some PE files
-#   everything from the DelayImport direction is in .rdata, with the
+#   everything from the DelayImport directory is in .rdata, with the
 #   exception of the current thunks, in .data
 #   Therefore if we want to add an imported function, we may need to
 #   modify two sections.
@@ -988,8 +1051,9 @@ class SHList(CArray):
 # modifications.
 
 # Depending on how the PE file has been generated, the place
-# where the directories are found varies a lot. Here are a
-# few examples:
+# where the directories are found varies a lot. Option '-Sl'
+# of readpe.py can show in whihc section are the directories and
+# the layout of the file. Here are a few examples:
 #
 # MinGW
 #   DirEnt IMPORT       in .idata (as recommended by the reference doc of PE)
@@ -998,14 +1062,14 @@ class SHList(CArray):
 # Some old Microsoft files
 #   DirEnt BOUND_IMPORT in headers (after PE header)
 #   DirEnt IMPORT       in .text
-#   DirEnt EXPORT       in .text
 #   DirEnt DELAY_IMPORT in .text
+#   DirEnt EXPORT       in .text
 #   DirEnt LOAD_CONFIG  in .text
 #   DirEnt IAT          in .text (contains IMPORT current Thunks)
 #   DirEnt DEBUG        in .text
 #   DirEnt RESOURCE     in .rsrc
 #   DirEnt BASERELOC    in .reloc
-#   DirEnt SECURITY     in .reloc or in no section
+#   DirEnt SECURITY     in no section
 #   Thunks DELAY_IMPORT original in .text, current in .data
 #
 # Some more recent Microsoft files
@@ -1013,12 +1077,28 @@ class SHList(CArray):
 #   DirEnt DEBUG        in .text
 #   DirEnt IAT          in .rdata (contains IMPORT current Thunks)
 #   DirEnt IMPORT       in .rdata
+#   DirEnt DELAY_IMPORT in .rdata
 #   DirEnt EXPORT       in .rdata
 #   DirEnt LOAD_CONFIG  in .rdata
 #   DirEnt EXCEPTION    in .pdata
 #   DirEnt RESOURCE     in .rsrc
 #   DirEnt BASERELOC    in .reloc
-#   DirEnt SECURITY     in .reloc
+#   DirEnt SECURITY     in no section
+#
+# Some other executables
+#   DirEnt DEBUG        in .text
+#   DirEnt IAT          in .idata (contains IMPORT current Thunks)
+#   DirEnt IMPORT       in .idata
+#   DirEnt DELAY_IMPORT in .text
+#   DirEnt EXPORT       in .text
+#   DirEnt LOAD_CONFIG  in .text
+#   DirEnt EXCEPTION    in .pdata
+#   DirEnt RESOURCE     in .rsrc
+#   DirEnt BASERELOC    in .reloc
+#   DirEnt SECURITY     in no section
+#   DirEnt TLS          in .rdata
+
+from elfesteem.visual_studio_mangling import symbol_demangle
 
 class CArrayDirectory(CArray):
     def unpack(self, c, o):
@@ -1052,9 +1132,6 @@ class ImportNamePtr(CStruct):
             self.name = self.obj
         else:
             off = self.parent.parent.rva2off(self.rva)
-            if self.rva < self.parent.parent.parent.parent.NThdr.sizeofheaders:
-                # Negate the hack in rva2off
-                off = None
             # When parsing 'firstthunk', either "off' is None
             # or it is identical to 'originalfirstthunk'.
             # But that's just what is usually the case, a valid PE
@@ -1082,74 +1159,87 @@ class ImportDescriptor(CStruct):
         return self.parent.parent.rva2off(rva)
     def unpack(self, c, o):
         CStruct.unpack(self, c, o)
-        if self.name_rva:
-            # Follow the RVAs
-            of = self.rva2off(self.name_rva)
-            if of is None:
-                log.error('NAME')
-            else:
-                self.name = CString(parent=self, content=c, start=of)
-            of = self.rva2off(self.firstthunk)
-            if of is None:
-                log.error('IAT')
-            else:
-                self.IAT = ImportThunks(parent=self, content=c, start=of)
-            # NB: http://win32assembly.programminghorizon.com/pe-tut6.html
-            # says "Some linkers generate PE files with 0 in
-            # OriginalFirstThunk. This is considered a bug."
-            # An example is the IDA installer!
-            of = self.rva2off(self.originalfirstthunk)
-            if not of in (0, None):
-                self.ILT = ImportThunks(parent=self, content=c, start=of)
+        if self.parent.stop(self):
+            # Don't continue to parse the terminator
+            return
+        # Follow the RVAs
+        of = self.rva2off(self.name_rva)
+        if of is None:
+            self.name = '<invalid_dll_name>'
+            # e.g. Ange Albertini's imports_relocW7.exe where relocation
+            # is modifying the import table.
+            # TODO: apply relocations before the decoding.
+        else:
+            self.name = CString(parent=self, content=c, start=of)
+        of = self.rva2off(self.firstthunk)
+        if of is None:
+            log.error('IAT')
+        else:
+            self.IAT = ImportThunks(parent=self, content=c, start=of)
+        # NB: http://win32assembly.programminghorizon.com/pe-tut6.html
+        # says "Some linkers generate PE files with 0 in
+        # OriginalFirstThunk. This is considered a bug."
+        # An example is the IDA installer!
+        of = self.rva2off(self.originalfirstthunk)
+        if not of in (0, None):
+            self.ILT = ImportThunks(parent=self, content=c, start=of)
 
 class DirImport(CArrayDirectory):
     _cls = ImportDescriptor
     _idx = DIRECTORY_ENTRY_IMPORT
     def display(self):
-        print("<%s>" % self.__class__.__name__)
+        res = '<%s>' % self.__class__.__name__
+        def repr_obj(obj):
+            if hasattr(obj, 'name'):
+                name, _ = symbol_demangle(str(obj.name))
+                return '%04X %r' % (obj.hint, name)
+            else: return repr(obj)
         for idx, d in enumerate(self):
-            print("%2d %r"%(idx,d.name))
+            res += '\n%2d %r' % (idx, str(d.name))
             for jdx, t in enumerate(d.IAT):
                 t_virt = self.parent.rva2virt(d.firstthunk+jdx*t.bytelen)
-                t_obj = repr(t.obj)
+                t_obj = repr_obj(t.obj)
                 # Only display original thunks that are incoherent with current
-                if hasattr(d, 'ILT'):
+                if hasattr(d, 'ILT') and jdx < len(d.ILT):
                     u = d.ILT[jdx]
                     if u.rva != t.rva:
-                        t_obj += ' %r' % u.obj
-                print("        %2d %#10x %s"%(jdx,t_virt,t_obj))
+                        t_obj += ' ' + repr_obj(u.obj)
+                res += '\n        %2d %#10x %s' % (jdx, t_virt, t_obj)
+        return res
     def pack(self):
         raise AttributeError("Cannot pack '%s': the Directory Entry data is not always contiguous"%self.__class__.__name__)
-    def add_imports(self, *args):
-        # We add a new ImportDescriptor for each new DLL
-        # We need to avoid changing RVA of the current IAT, because they
-        # can be used e.g. in the executable section .text
-        # But there might not be enough space after the current list of
-        # descriptors to add new descriptors...
-        # The trick we use is to move the list of descriptors in a new
-        # section, where we will also store the new ILT, IAT and names,
-        # leaving the original section unchanged.
-        e = self.parent
-        s = e.SHList.add_section(
-            name='.idata2',
-            flags=IMAGE_SCN_MEM_WRITE|IMAGE_SCN_MEM_READ|IMAGE_SCN_CNT_INITIALIZED_DATA,
-            rsize=0x1000,     # should be enough
-            )
-        base_rva = e.off2rva(s.scnptr)
-        e.NThdr.optentries[self._idx].rva = base_rva
-        self._size += self._last.bytelen * len(args)
-        of = self.bytelen
-        s.data.data = StrPatchwork()
-        for dll_name, dll_func in args:
+    def stop(self, elt):
+        # Ange Albertini's imports_badterm.exe and imports_tinyXP.exe shows
+        # that the ImportDescriptor does not need to be all zeroes to be a
+        # terminator.
+        return elt.name_rva == 0 or elt.firstthunk == 0
+        # According to Ange Albertini's manyimportsW7.exe the AddressOfIndex
+        # field of the TLS directory is a terminator too; but at this point
+        # the TLS directory has not been parsed by elfesteem. This will be
+        # handled if we handle relocations, and parse the file in multiple
+        # passes.
+    def _initialize(self):
+        CArrayDirectory._initialize(self)
+        # Imports are added in three steps: dll_to_add is computed, a
+        # new section is created, this section is constructed.
+        self.dll_to_add = []
+    def add_dlldesc(self, new_dll):
+        # Expand self.dll_to_add with new DLL and functions
+        # new_dll is a list, where each member is a pair
+        # - dll_name: dict with 'name' giving the DLL name
+        #             The 'firstthunk' value is currently ignored:
+        #             elfesteem used this value to indicate another
+        #             section where the IAT would be located, and
+        #             did not create an ILT.
+        #             TODO: memorize this value to be used in
+        #             'write_directory'
+        # - dll_func: list of function names
+        for dll_name, dll_func in new_dll:
             # First, an empty descriptor
             d = ImportDescriptor(parent=self)
-            self._array.append(d)
+            self.dll_to_add.append(d)
             # Add the DLL name
-            d.name = CString(parent=d, s=dll_name)
-            d.name_rva = base_rva+of
-            s.data.data[of] = d.name.pack()
-            of += d.name.bytelen
-            if of%2: of += 1
+            d.name = CString(parent=d, s=dll_name['name'].encode('latin1'))
             # Add the Import names; they will be located after the two thunks
             thunk_len = (1+len(dll_func))*(self.wsize/8)
             thunk_len *= 2
@@ -1157,62 +1247,124 @@ class DirImport(CArrayDirectory):
             d.ILT = ImportThunks(parent=d)
             for n in dll_func:
                 t = ImportNamePtr(parent=d.ILT)
-                t.obj = ImportName(parent=t, s=n)
-                t.rva = base_rva+of+thunk_len
+                t.obj = ImportName(parent=t, s=n.encode('latin1'))
                 t.name = n
-                s.data.data[of+thunk_len] = t.obj.pack()
                 thunk_len += t.obj.bytelen
                 if thunk_len%2: thunk_len += 1
                 d.ILT.append(t)
-            d.originalfirstthunk = base_rva+of
-            s.data.data[of] = d.ILT.pack()
-            of += d.ILT.bytelen
             d.IAT = ImportThunks(parent=d)
             for n in dll_func:
                 t = ImportNamePtr(parent=d.ILT)
-                t.rva = d.ILT[len(d.IAT)].rva
-                t.obj = d.ILT[len(d.IAT)].obj
                 t.name = n
                 d.IAT.append(t)
+    def write_directory(self, base_rva):
+        # Creates in the section starting at 'base_rva' a new Import Directory
+        # with the content of self.dll_to_add
+        
+        # Note that we need to avoid changing RVA of the current IAT, because
+        # they can be used e.g. in the executable section .text
+        # But there might not be enough space after the current list of
+        # descriptors to add new descriptors...
+        # The trick we use is to move the list of descriptors in a new
+        # section (s_dir), where we will also store the new ILT, IAT and
+        # names, leaving the original section unchanged.
+        # 
+        # TODO: The IAT can be stored in another section than the rest of
+        # the directory (descriptors, names, ILT) ; provide this possibility.
+        # TODO: The ILT is not necessary. Provide the possibility of not
+        # creating it.
+        # TODO: If base_rva is not the vaddr of an existing section, but
+        # is inside na existing section, do we overwrite everything after
+        # base_rva?
+
+        e = self.parent
+        for s_dir in e.SHList.shlist:
+            # This section may have been created by
+            #   e.SHList.add_section(name="myimp", rawsize=len(e.DirImport))
+            # which is the original syntax with elfesteem but does not
+            # use the appropriate value for rsize, because len(e.DirImport)
+            # now is the number of DLLs and not the bytelen of the directory.
+            # This does not matter, because we recompute s_dir.rsize at
+            # the end of this function.
+            if s_dir.vaddr == base_rva:
+                break
+        else:
+            # Create the new section s_dir, with appropriate flags; write
+            # is needed if we store the IAT.
+            s_dir = e.SHList.add_section(
+                name='.idata2',
+                flags=IMAGE_SCN_MEM_WRITE|IMAGE_SCN_MEM_READ|IMAGE_SCN_CNT_INITIALIZED_DATA,
+                rsize=0x1000,     # should be enough
+                )
+            base_rva = s_dir.vaddr
+        s_dir.section_data.data = StrPatchwork()
+        self._size += self._cls(parent=self).bytelen * len(self.dll_to_add)
+        of = self.bytelen
+        for d in self.dll_to_add:
+            self._array.append(d)
+            d.name_rva = base_rva+of
+            s_dir.section_data.data[of] = d.name.pack()
+            of += d.name.bytelen
+            if of%2: of += 1
+            thunk_len = (1+len(d.ILT))*(self.wsize//8)
+            thunk_len *= 2
+            for t in d.ILT:
+                t.rva = base_rva+of+thunk_len
+                s_dir.section_data.data[of+thunk_len] = t.obj.pack()
+                thunk_len += t.obj.bytelen
+                if thunk_len%2: thunk_len += 1
+            d.originalfirstthunk = base_rva+of
+            s_dir.section_data.data[of] = d.ILT.pack()
+            of += d.ILT.bytelen
             d.firstthunk = base_rva+of
-            s.data.data[of] = d.IAT.pack()
+            for idx, t in enumerate(d.IAT):
+                t.obj = d.ILT[idx].obj
+                t.rva = d.ILT[idx].rva
+            s_dir.section_data.data[of] = d.IAT.pack()
             of += thunk_len - d.ILT.bytelen
-        # Write the descriptor list (now that everyting has been computed)
-        s.data.data[0] = CArray.pack(self)
+        self.dll_to_add = []
+        # Write the descriptor list (now that all RVA have been computed)
+        s_dir.section_data.data[0] = CArray.pack(self)
         # Update the section sizes
-        s.paddr = len(s.data.data)
-        e.NThdr.optentries[self._idx].size = s.paddr # Unused by PE loaders
-        if s.rsize < s.paddr:
-            s.rsize = s.paddr
-        s.data.data[s.paddr] = data_null*(s.rsize-s.paddr)
+        s_dir.paddr = len(s_dir.section_data.data)
+        if s_dir.rsize < s_dir.paddr:
+            s_dir.rsize = s_dir.paddr
+        s_dir.section_data.data[s_dir.paddr] = data_null*(s_dir.rsize-s_dir.paddr)
+        e.NThdr.optentries[self._idx].rva = base_rva
+        e.NThdr.optentries[self._idx].size = s_dir.paddr # Unused by PE loaders
+    def get_funcrva(self, dllname, funcname):
+        # Position of the function in the Import Address Table
+        for d in self:
+            if dllname is not None and str(d.name) != dllname:
+                continue
+            for idx, t in enumerate(d.IAT):
+                if t.name == funcname:
+                    return d.firstthunk+idx*t.bytelen
+        return None
+    def get_funcvirt(self, dllname, funcname):
+        return self.parent.rva2virt(self.get_funcrva(dllname, funcname))
     # For API compatibility with previous versions of elfesteem
     def get_dlldesc(self):
         return [ ({'name': d.name}, [t.name for t in d.IAT]) for d in self ]
-    def add_dlldesc(self, new_dll):
-        args = []
-        for dll_name, dll_func in new_dll:
-            args.append((dll_name['name'],dll_func))
-        self.add_imports(*args)
+    def set_rva(self, addr):
+        self.write_directory(addr)
     def impdesc(self):
         class ImpDesc_e(object):
             def __init__(self, d):
-                class Name(object):
-                    def __init__(self, s):
-                        self.name = s
                 self.firstthunk = d.firstthunk
-                self.dlldescname = Name(str(d.name))
-                self.impbynames = [Name(str(_.obj.name)) for _ in d.ILT]
+                self.dlldescname = APICompatibilityName(str(d.name))
+                self.impbynames = [APICompatibilityName(str(_.name)) for _ in d.IAT]
         return [ImpDesc_e(_) for _ in self]
-    impdesc = property(impdesc)
-    def get_funcrva(self, name):
-        # Position of the function in the Import Address Table
-        for d in self:
-            for idx, t in enumerate(d.IAT):
-                if t.name == name:
-                    return d.firstthunk+idx*t.bytelen
-        return None
-    def get_funcvirt(self, name):
-        return self.parent.rva2virt(self.get_funcrva(name))
+    def set_impdesc(self, value):
+        if value in (None, []):
+            CArrayDirectory._initialize(self)
+            return
+        TODO
+    impdesc = property(impdesc, set_impdesc)
+class APICompatibilityName(object):
+    def __init__(self, s):
+        self.name = s
+ImportByName = APICompatibilityName
 
 
 # Delay Import Directory is similar to Import Directory
@@ -1309,11 +1461,15 @@ class ExportDescriptor(CStruct):
             start=self.rva2off(self.addressofnames))
         self.EOT = ExportOrdinalTable(parent=self, content=c,
             start=self.rva2off(self.addressofordinals))
+        self.compute_exports()
+    def compute_exports(self):
         # 'exports' contains the same information as displayed by IDA's export
         # tab; it has issues, especially when the number of functions is not
         # the number of names
         self.exports = {}
-        for i in range(self.numberofnames):
+        for i in range(len(self.ENPT)):
+            # len(self.ENPT) is self.numberofnames, unless it is invalid.
+            # If self.numberofnames is invalid we prefer the smaller value!
             j = self.EOT[i].ordinal
             if j >= self.numberoffunctions:
                 print("Invalid ordinal[%d]: %d"%(i,j))
@@ -1325,7 +1481,8 @@ class ExportDescriptor(CStruct):
             name = self.ENPT[i].name
             self.exports[self.base+j] = (addr, name)
         # When ..numberoffunctions != ..numberofnames
-        for i in range(self.numberoffunctions):
+        for i in range(len(self.EAT)):
+            # len(self.EAT) is self.numberoffunctions, unless it is invalid.
             if not self.base+i in self.exports:
                 addr = self.EAT[i]
                 self.exports[self.base+i] = (addr, CString(parent=self))
@@ -1335,10 +1492,10 @@ class DirExport(CArrayDirectory):
     _idx = DIRECTORY_ENTRY_EXPORT
     count = lambda _: 1
     def display(self):
-        print("<%s>" % self.__class__.__name__)
+        res = '<%s>' % self.__class__.__name__
         if len(self) == 0: return
         d = self[0]
-        print("  %r"%d.name)
+        res += '\n  %r' % str(d.name)
         for i in sorted(d.exports.keys()):
             addr, name = d.exports[i]
             if hasattr(addr, 'name'):
@@ -1349,7 +1506,9 @@ class DirExport(CArrayDirectory):
                     # To have the same display as IDA on PE for ARM
                     addr -= 1
                 addr = '%08X' % self.parent.rva2virt(addr)
-            print('    %2d %s %r'%(i,addr,name))
+            name, _ = symbol_demangle(str(name))
+            res += '\n    %2d %s %r' % (i, addr, name)
+        return res
     def create(self, funcs, name = 'default.dll'):
         # Don't separate 'create()' and 'add_name()' because adding new
         # exports to an existing export table is very tricky: we need to
@@ -1363,15 +1522,15 @@ class DirExport(CArrayDirectory):
             )
         base_rva = e.off2rva(s.scnptr)
         e.NThdr.optentries[self._idx].rva = base_rva
-        s.data.data = StrPatchwork()
+        s.section_data.data = StrPatchwork()
         # First, an empty descriptor
         d = ExportDescriptor(parent=self, base=1)
         self.append(d)
         of = self.bytelen
         # Add the DLL name
-        d.name = CString(parent=d, s=name)
+        d.name = CString(parent=d, s=name.encode('latin1'))
         d.name_rva = base_rva+of
-        s.data.data[of] = d.name.pack()
+        s.section_data.data[of] = d.name.pack()
         of += d.name.bytelen
         # Add the EAT, ENPT & EOT
         d.numberoffunctions += len(funcs)
@@ -1386,45 +1545,50 @@ class DirExport(CArrayDirectory):
             t = ExportAddressRVA(parent=d.EAT, rva=rva)
             d.EAT.append(t)
         d.addressoffunctions = base_rva+of
-        s.data.data[of] = d.EAT.pack()
+        s.section_data.data[of] = d.EAT.pack()
         of += d.EAT.bytelen
         d.EOT = ExportOrdinalTable(parent=d)
         for idx in range(len(funcs)):
             t = ExportOrdinal(parent=d.EOT, ordinal=idx)
             d.EOT.append(t)
         d.addressofordinals = base_rva+of
-        s.data.data[of] = d.EOT.pack()
+        s.section_data.data[of] = d.EOT.pack()
         of += d.EOT.bytelen
         pos = len(funcs)*4 # size of ENPT
         d.ENPT = ExportNamePointersTable(parent=d)
         for f in funcs:
             if isinstance(f, tuple): f = f[0] # The name of the function
             t = ExportNamePointerRVA(parent=d.ENPT)
-            t.name = CString(parent=t, s=f)
+            t.name = CString(parent=t, s=f.encode('latin1'))
             t.name.name = f # For API compatibility with previous versions
             t.rva = base_rva+of+pos
-            s.data.data[of+pos] = t.name.pack()
+            s.section_data.data[of+pos] = t.name.pack()
             pos += t.name.bytelen
             d.ENPT.append(t)
         d.addressofnames = base_rva+of
-        s.data.data[of] = d.ENPT.pack()
+        s.section_data.data[of] = d.ENPT.pack()
         # Write the descriptor list (now that everyting has been computed)
-        s.data.data[0] = CArray.pack(self)
+        s.section_data.data[0] = CArray.pack(self)
         # Update the section sizes
-        s.paddr = len(s.data.data)
+        s.paddr = len(s.section_data.data)
         e.NThdr.optentries[self._idx].size = s.paddr # Unused by PE loaders
         if s.rsize < s.paddr:
             s.rsize = s.paddr
-        s.data.data[s.paddr] = data_null*(s.rsize-s.paddr)
+        s.section_data.data[s.paddr] = data_null*(s.rsize-s.paddr)
+        # Finalize
+        d.compute_exports()
     def get_funcrva(self, name):
         for d in self:
-            for t in d.INPT:
-                if t.name == name: return t.rva
+            for t in d.ENPT:
+                if str(t.name) == name: return t.rva
         return None
     def get_funcvirt(self, name):
         return self.parent.rva2virt(self.get_funcrva(name))
     # For API compatibility with previous versions of elfesteem
-    expdesc        = property(lambda _:_[0] if len(_) else None)
+    def expdesc(self):
+        if len(self): return self[0]
+        else:         return None
+    expdesc        = property(expdesc)
     f_address      = property(lambda _:getattr(_.expdesc,'EAT',[]))
     f_nameordinals = property(lambda _:getattr(_.expdesc,'EOT',[]))
     f_names        = property(lambda _:getattr(_.expdesc,'ENPT',[]))
@@ -1452,21 +1616,28 @@ class RelocationBlock(CStruct):
                 ("size","u32"), # Should be at least 8
                 ("rels", RelocationTable) ]
     # TODO: don't parse 'rels' if it goes beyond the end of the directory
+    def __repr__(self):
+        return '<%s RVA=%#x size=%d [table of length %d]>' % (
+            self.__class__.__name__,
+            self.rva, self.size, len(self.rels))
 
 class DirReloc(CArrayDirectory):
     _cls = RelocationBlock
     _idx = DIRECTORY_ENTRY_BASERELOC
     def count(self):
+        if self._idx >= len(self.parent.NThdr.optentries):
+            return -1
         # We don't know how many relocation block will be parsed, we stop
         # when reaching the end of the directory
         if self.bytelen < self.parent.NThdr.optentries[self._idx].size:
             return len(self)+1
         return -1
     def display(self):
-        print("<%s>" % self.__class__.__name__)
+        res = '<%s>' % self.__class__.__name__
         for b in self:
-             print("   %r"%b)
+             res += '\n   %r' % b
              # Don't display the relocation table... too long
+        return res
     def add_reloc(self, rels, rtype = 3, patchrel = True):
         TODO
     def del_reloc(self, taboffset):
@@ -1498,6 +1669,10 @@ class ResourceDataDescription(CStruct):
         # Follow the RVA
         of=self.parent.rva2off(self.rva)
         self.data = c[of:of+self.size]
+    def __repr__(self):
+        return '<%s RVA=%#x size=%d codepage=%d zero=%d>' % (
+            self.__class__.__name__,
+            self.rva, self.size, self.codepage, self.zero)
 
 class ResourceDirectoryEntry(CStruct):
     _fields = [ ("id","u32"),
@@ -1516,7 +1691,10 @@ class ResourceDirectoryEntry(CStruct):
         if self.id & 0x80000000:
             self.name = UString(parent=self, content=c,
                 start=self.base + (self.id & 0x7FFFFFFF))
-        if self.depth >= 10: # In Windows PE, should never be more than 2
+        if self.depth >= 10:
+            # In Windows PE, should never be more than 2.
+            # An example of file with an infinite depth is Ange Albertini's
+            # resourceloop.exe
             log.warning('Resource tree too deep')
         elif self.offset & 0x80000000:
             self.dir = ResourceDescriptor(parent=self, content=c,
@@ -1530,10 +1708,15 @@ class ResourceDirectoryEntry(CStruct):
         else:                     return p.depth+1
     depth = property(depth)
     def show_tree(self):
+        if self.depth >= 10:
+            return [ (0, None) ]
+        def choose(val, true, false):
+            if val & 0x80000000: return true
+            else:                return false
         s = (
             self.parent._array.index(self),
-            str(self.name) if self.id & 0x80000000 else self.id,
-            None if self.offset & 0x80000000 else self.data
+            choose(self.id, getattr(self, 'name', None), self.id),
+            choose(self.offset, None, getattr(self, 'data', None)),
             )
         tree = [ (0, s) ]
         if self.offset & 0x80000000:
@@ -1577,8 +1760,9 @@ class DirRes(CArrayDirectory):
             if d > 2: return False
         return True
     def display(self):
-        print("<%s>" % self.__class__.__name__)
-        if len(self) == 0: return
+        res = '<%s>' % self.__class__.__name__
+        if len(self) == 0:
+            return res
         if self.is_depth_3_tree():
             # Windows-specific display, tree with all branches of depth 3
             assert self[0].characteristics == 0
@@ -1589,7 +1773,7 @@ class DirRes(CArrayDirectory):
             # says it is always 0
             assert self[0].majorv in (0, 4)
             assert self[0].minorv == 0
-            print('     Index     Type     Name Lang')
+            res += '\n     Index     Type     Name Lang'
             pos = [None, None, None]
             val = [None, None, None]
             for d, (x, y, z) in self[0].show_tree():
@@ -1599,11 +1783,15 @@ class DirRes(CArrayDirectory):
                     assert z is None
                     continue
                 assert d == 2
-                print('  %2d %2d %2d %8s %8s %4s %r'%tuple(pos+val+[z]))
+                res += '\n  %2d %2d %2d %8s %8s %4s %r' % tuple(pos+val+[z])
         else:
             # Generic display
             for d, s in self[0].show_tree():
-                print((1+d)*'  ' + str(s))
+                if s is None:
+                    res += '\n' + (1+d)*'  ' + str(s)
+                else:
+                    res += '\n' + (1+d)*'  ' + '%d %s %r' % s
+        return res
 
 
 
@@ -1676,30 +1864,35 @@ class CoffSymbol(CStruct):
             n = self.parent.parent.SymbolStrings.getby_offset(n)
         else:
             n = n.rstrip(data_null)
-        return bytes_to_name(n)
+        n = bytes_to_name(n)
+        n, _ = symbol_demangle(n)
+        return n
     name = property(name)
-    def __repr__(self):
+    def section(self):
         SHList = self.parent.parent.SHList
-        s  = repr(self.name)
-        s += " value=0x%x" % self.value
         if 0 < self.sectionnumber < 1+len(SHList):
-            s += " section=%s" % SHList[self.sectionnumber-1].name
+            return SHList[self.sectionnumber-1].name
         else:
-            s += " section=0x%x" % self.sectionnumber
+            return '%#x' % self.sectionnumber
+    section = property(section)
+    def type_str(self):
         base_type = self.type & 0xf
         cplx_type = self.type >> 4
         if base_type != 0:
-            s += " type=%s" % constants['IMAGE_SYM_TYPE'][base_type]
+            return constants['IMAGE_SYM_TYPE'][base_type]
         elif cplx_type in constants['IMAGE_SYM_DTYPE']:
-            s += " type=%s" % constants['IMAGE_SYM_DTYPE'][cplx_type]
+            return constants['IMAGE_SYM_DTYPE'][cplx_type]
         else:
-            s += " type=0x%x" % cplx_type
+            return '%#x' % cplx_type
+    type_str = property(type_str)
+    def storage(self):
         if self.storageclass in constants['IMAGE_SYM_CLASS']:
-            s += " storage=%s" % constants['IMAGE_SYM_CLASS'][self.storageclass]
+            return constants['IMAGE_SYM_CLASS'][self.storageclass]
         else:
-            s += " storage=0x%x" % self.storageclass
-        s += " aux=%r" % self.aux
-        return "<CoffSymbol " + s + ">"
+            return '%#x' % self.storageclass
+    storage = property(storage)
+    def __repr__(self):
+        return "<CoffSymbol %r value=%#x section=%s type=%s storage=%s aux=%r>" % (self.name, self.value, self.section, self.type_str, self.storage, self.aux)
 
 class CoffSymbols(CArray):
     _cls = CoffSymbol
@@ -1721,6 +1914,13 @@ class CoffSymbols(CArray):
             n -= 1 + len(s.aux)
         else:
             return None
+    def display(self):
+        res = '<%s>' % self.__class__.__name__
+        for s in self.symbols:
+            res += '\n    name=%r' % s.name
+            res += '\n        type=%-8s storage=%-9s value=%#010x section=%s' % (s.type_str, s.storage, s.value, s.section)
+        return res
+
     # For API compatibility with previous versions of elfesteem
     symbols = property(lambda _: _._array)
 
