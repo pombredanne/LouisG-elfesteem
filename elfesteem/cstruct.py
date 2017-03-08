@@ -56,6 +56,10 @@ class CBase(object):
       sex and wsize: endianess and wordsize
     """
     def __init__(self, *args, **kargs):
+        if not 'parent' in kargs:
+            # Old API of elfesteem
+            # e.g. used by miasm2's example/jitter/unpack_upx.py
+            kargs['parent'] = args[0]
         self._parent_parse(kargs)
         self._initialize()
         if 'content' in kargs:
@@ -119,7 +123,7 @@ class CString(CBase):
     def __str__(self):
         return bytes_to_name(self.X)
     def __repr__(self):
-        return repr(self.X)
+        return '<CString %r>' % self.X
     def pprint(self):
         return self.X
 
@@ -206,7 +210,7 @@ class CStruct(CStruct_base):
         self._size = struct.calcsize(self._packstring)
         for f in self._names:
             # Default values
-            if self._format[f].endswith('s'): self.setf(f,'')
+            if self._format[f].endswith('s'): self.setf(f,data_empty)
             else:                             self.setf(f,0)
         for fname, fclass in self._opt:
             v = fclass(parent=self)
@@ -301,7 +305,9 @@ class CArray(CArray_base):
         self._size  = 0
         if not hasattr(self, 'count'):
             # Array end is decided by a terminating element
-            # which is the default value of an object of class _cls
+            # which is detected by 'stop', of by default by
+            # comparing with the default value of an object
+            # of class _cls
             self._last  = self._cls(parent=self)
             self._size  += self._size_align(self._last)
 
@@ -313,13 +319,19 @@ class CArray(CArray_base):
                 % (self._size,len(s), self.__class__.__name__))
         return s
 
+    def stop(self, elt):
+        return elt.pack() == self._last.pack()
+
     def unpack(self, c, o):
+        if o is None: return
         self._off = o
         if hasattr(self, 'count'):
             # self.count() is recomputed each time
             # This enables complicated conditions for array termination
             idx = 0
             while idx < self.count():
+                if o+self._size >= len(c):
+                    break
                 elt = self._cls(parent=self, content=c, start=o+self._size)
                 self._array.append(elt)
                 self._size += self._size_align(elt)
@@ -327,8 +339,10 @@ class CArray(CArray_base):
         else:
             pos = 0
             while True:
+                if o+pos >= len(c):
+                    break
                 elt = self._cls(parent=self, content=c, start=o+pos)
-                if elt.pack() == self._last.pack():
+                if self.stop(elt):
                     break
                 self._array.append(elt)
                 pos += self._size_align(elt)

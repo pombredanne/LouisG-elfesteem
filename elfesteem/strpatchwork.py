@@ -14,6 +14,7 @@ class StrPatchwork(object):
         self.s_cache = s
         self.paddingbyte=paddingbyte
     def __str__(self):
+        return self.s.tostring() # Needed for miasm2 :-(
         raise AttributeError("Use pack() instead of str()")
     def pack(self):
         return self.s.tostring()
@@ -31,13 +32,15 @@ class StrPatchwork(object):
                     r.extend(array("B",self.paddingbyte*(end-len(s))))
                 else:
                     # We are entirely after the end of 's'
-                    r = array("B",self.paddingbyte*(end-item.start))
+                    start = item.start
+                    if start is None: start = 0
+                    r = array("B",self.paddingbyte*(end-start))
             return r.tostring()
         else:
             if item > len(s):
                 return self.paddingbyte
             else:
-                return chr(s[item])
+                return array("B",[s[item]]).tostring()
     def __setitem__(self, item, val):
         if val == None:
             return
@@ -64,13 +67,13 @@ class StrPatchwork(object):
         self.s.extend(array("B", other))
         return self
 
-    def find(self, pattern, offset = 0):
+    def find(self, pattern, *args):
         if not self.s_cache:
             self.s_cache = self.s.tostring()
-        return self.s_cache.find(pattern, offset)
+        return self.s_cache.find(pattern, *args)
 
-    def rfind(self, pattern, start = 0, end = None):
+    def rfind(self, pattern, *args):
         if not self.s_cache:
             self.s_cache = self.s.tostring()
-        return self.s_cache.rfind(pattern, start, end)
+        return self.s_cache.rfind(pattern, *args)
 

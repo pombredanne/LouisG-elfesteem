@@ -1,10 +1,11 @@
 #! /usr/bin/env python
-import sys
+import sys, os
 
 if sys.version_info[0] == 2 and sys.version_info[1] < 5:
     sys.stderr.write("python version older than 2.5 is not supported\n")
     exit(1)
 
+sys.path.insert(1, os.path.abspath(sys.path[0]+'/..'))
 from elfesteem import pe_init, pe
 import pprint, struct
 
@@ -23,7 +24,7 @@ def print_petype(e):
     machine = pe.constants['IMAGE_FILE_MACHINE'].get(COFFhdr.machine,
         "UNKNOWN(%#x)" % COFFhdr.machine)
     if hasattr(e, 'NThdr'):
-        print("PE for %s"%machine)
+        print("PE for %s (%s header)"%(machine,struct.pack("<H",e.DOShdr.magic)))
     else:
         print("COFF for %s"%machine)
     print("COFF: %d sections, %d symbols; flags %#x; szopthdr %#x" % (
@@ -56,8 +57,8 @@ def print_petype(e):
             ))
     print("MaxAddr %#x" % e.virt.max_addr())
     if hasattr(e, 'NThdr'):
-        print("NThdr: Sig %#x OSver %d.%d IMGver %d.%d subsystem %s v%d.%d" % (
-            e.NTsig.signature,
+        print("NThdr: Sig %s OSver %d.%d IMGver %d.%d subsystem %s v%d.%d" % (
+            struct.pack("<H",e.NTsig.signature),
             e.NThdr.majoroperatingsystemversion,
             e.NThdr.minoroperatingsystemversion,
             e.NThdr.MajorImageVersion,
@@ -88,16 +89,27 @@ def print_sections(e):
         print("\nNT HEADERS")
         print("No          Name         addr      memsz")
         for i, s in enumerate(e.NThdr.optentries):
-            n = e.getsectionbyrva(s.rva)
+            if i == pe.DIRECTORY_ENTRY_SECURITY:
+                n = e.getsectionbyoff(s.rva)
+            else:
+                n = e.getsectionbyrva(s.rva)
             if n is None:
                 class NoSection(object):
                     name = '<no section>'
                 n = NoSection()
+            dirname = pe.constants['DIRECTORY_ENTRY'].get(i, '<noname>')
             print("%2d %15s %#10x %#10x %12s" %(i,
-                   pe.constants['DIRECTORY_ENTRY'][i],
+                   dirname,
                    s.rva, s.size,
                    '' if s.size == 0 else n.name.strip('\0')
                    ))
+
+def print_symtab(e):
+    if hasattr(e, 'Symbols'):
+        print(e.Symbols.display())
+    if hasattr(e, 'OSF1Symbols'):
+        print("\nOSF1/Tru64 SYMBOLS")
+        print("%r"%e.OSF1Symbols)
 
 from operator import itemgetter
 def print_layout(e, filesz):
@@ -129,11 +141,7 @@ def print_layout(e, filesz):
     if hasattr(e, 'NThdr'):
         layout.append((DOShdr.lfanew, of-DOShdr.lfanew, 'PE header'))
     for i, s in enumerate(e.SHList):
-        if s.rsize == 0:
-            # Empty section, not in the file!
-            continue
-        if s.flags & (pe.STYP_BSS|pe.STYP_SBSS|pe.STYP_DSECT):
-            # bss/dummy section, not in the file!
+        if not s.is_in_file():
             continue
         if i == 0 and s.name.startswith('$'):
             # '$build.attributes' dummy section is seen in TI COFF sample file
@@ -250,11 +258,17 @@ def print_layout(e, filesz):
                         for jdx, t in enumerate(getattr(d, 'IAT', [])):
                             if not hasattr(t.obj, '_size'):
                                 continue
-                            if jdx >= len(getattr(d, 'ILT', [])):
+                            if jdx < len(getattr(d, 'ILT', [])) \
+                               and hasattr(d.ILT[jdx].obj, '_size'):
+                                assert t.rva == d.ILT[jdx].rva
                                 continue
-                            if not hasattr(d.ILT[jdx].obj, '_size'):
-                                continue
-                            assert t.rva == d.ILT[jdx].rva
+                            # Aligned to 2 bytes
+                            size = t.obj.bytelen
+                            if size % 2: size += 1
+                            layout.append((
+                                e.rva2off(t.rva),
+                                size,
+                                '%s IATname [%d,%d]' % (name, idx, jdx)))
                 elif i == pe.DIRECTORY_ENTRY_EXPORT:
                     directory = e.DirExport
                     layout.append((
@@ -378,11 +392,11 @@ def print_layout(e, filesz):
         print("Not in a section: %s" % (' '.join(l[2:])))
 
 def pe_dir_display(e):
-    if hasattr(e, 'DirImport'): e.DirImport.display()
-    if hasattr(e, 'DirExport'): e.DirExport.display()
-    if hasattr(e, 'DirDelay'):  e.DirDelay.display()
-    if hasattr(e, 'DirRes'):    e.DirRes.display()
-    if hasattr(e, 'DirReloc'):  e.DirReloc.display()
+    if hasattr(e, 'DirImport'): print(e.DirImport.display())
+    if hasattr(e, 'DirExport'): print(e.DirExport.display())
+    if hasattr(e, 'DirDelay'):  print(e.DirDelay.display())
+    if hasattr(e, 'DirRes'):    print(e.DirRes.display())
+    if hasattr(e, 'DirReloc'):  print(e.DirReloc.display())
 
 if __name__ == '__main__':
     import argparse
@@ -404,7 +418,12 @@ if __name__ == '__main__':
         if len(args.file) > 1:
             print("\nFile: %s" % file)
         raw = open(file, 'rb').read()
-        if raw[:2] == struct.pack("2B", 0x4d,0x5a):
+        if raw[:2] in (
+            # MZ magic for DOS executable, normally for all PE/COFF files
+            struct.pack("2B", 0x4d,0x5a),
+            # HR magic found in bochsys.dll from IDA
+            struct.pack("2B", 0x48,0x52),
+            ):
             e = pe_init.PE(raw)
             if e.NTsig.signature != 0x4550:
                 print('Not a valid PE')
@@ -421,11 +440,7 @@ if __name__ == '__main__':
         if 'sections' in args.options:
             print_sections(e)
         if 'symtab' in args.options:
-            if hasattr(e, 'Symbols'):
-                for s in e.Symbols.symbols:
-                    print("%r"%s)
-            if hasattr(e, 'OSF1Symbols'):
-                print("%r"%e.OSF1Symbols)
+            print_symtab(e)
         if 'reltab' in args.options:
             for s in e.SHList:
                 if s.nreloc:

@@ -3,12 +3,7 @@
 import struct, array
 from elfesteem import pe
 from elfesteem.strpatchwork import StrPatchwork
-import logging
-log = logging.getLogger("peparse")
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter("%(levelname)-5s: %(message)s"))
-log.addHandler(console_handler)
-log.setLevel(logging.WARN)
+log = pe.log
 
 
 
@@ -24,7 +19,7 @@ class ContentManager(object):
         self.__set__(owner, None)
 
 
-class drva(object):
+class ContentRVA(object):
     def __init__(self, x):
         self.parent = x
     def get_slice_raw(self, item):
@@ -32,18 +27,16 @@ class drva(object):
             return None
         rva_items = self.get_rvaitem(item.start, item.stop, item.step)
         if rva_items is None:
-             return
-        data_out = ""
+             return pe.data_null
+        data_out = pe.data_empty
         for s, n_item in rva_items:
             if s is not None:
-                data_out += s.data.__getitem__(n_item)
+                data_out += s.section_data.__getitem__(n_item)
             else:
                 data_out += self.parent.__getitem__(n_item)
         return data_out
 
     def get_rvaitem(self, start, stop = None, section = None):
-        if self.parent.SHList is None:
-            return [(None, start)]
         if stop == None:
             s = self.parent.getsectionbyrva(start, section)
             if s is None:
@@ -66,7 +59,11 @@ class drva(object):
                 s = self.parent.getsectionbyrva(start, section)
                 if s is None:
                     log.warn('unknown rva address! %x'%start)
-                    return []
+                    # We would like to return an empty list, but it is
+                    # not compatible with miasm2 non-regression tests
+                    # If we return None, then reading at an unknown RVA
+                    # will result in getting one null byte.
+                    return None
                 s_max = s.rawsize
                 if hasattr(self.parent, 'NThdr'):
                     # PE, not COFF
@@ -95,18 +92,23 @@ class drva(object):
              return
         off = 0
         for s, n_item in rva_items:
+            if s is None:
+                log.warn('Cannot write at RVA %s', n_item)
+                continue
             i = slice(off, n_item.stop+off-n_item.start, n_item.step)
             data_slice = data.__getitem__(i)
-            s.data.__setitem__(n_item, data_slice)
+            s.section_data.__setitem__(n_item, data_slice)
             off = i.stop
             #XXX test patch content
             file_off = self.parent.rva2off(s.vaddr+n_item.start)
             if self.parent.content:
                 self.parent.content = self.parent.content[:file_off]+ data_slice + self.parent.content[file_off+len(data_slice):]
-        return #s.data.__setitem__(n_item, data)
+    def set(self, rva, data):
+        # API used by miasm2
+        self[rva] = data
 
 
-class virt(object):
+class ContentVirtual(object):
     def __init__(self, x):
         self.parent = x
 
@@ -122,12 +124,18 @@ class virt(object):
     def __getitem__(self, item):
         rva_item = self.item_virt2rva(item)
         return self.parent.drva.__getitem__(rva_item)
+    def get(self, start, end):
+        # Deprecated API
+        return self[start:end]
 
     def __setitem__(self, item, data):
         if not type(item) is slice:
             item = slice(item, item+len(data), None)
         rva_item = self.item_virt2rva(item)
         self.parent.drva.__setitem__(rva_item, data)
+    def set(self, addr, data):
+        # Deprecated API
+        self[addr] = data
 
     def __len__(self):
         # __len__ should not be used: Python returns an int object, which
@@ -165,7 +173,7 @@ class virt(object):
                 off = start - s.vaddr
             else:
                 off = 0
-            ret = s.data.find(pattern, off)
+            ret = s.section_data.find(pattern, off)
             if ret == -1:
                 continue
             if end != None and s.vaddr + ret >= end:
@@ -195,7 +203,7 @@ class virt(object):
             else:
                 off = 0
             if end == None:
-                ret = s.data.rfind(pattern, off)
+                ret = s.section_data.rfind(pattern, off)
             else:
                 ret = s.data.rfind(pattern, off, end-s.vaddr)
             if ret == -1:
@@ -210,15 +218,13 @@ class virt(object):
         ad_start = self.parent.virt2rva(ad_start)
         if ad_stop != None:
             ad_stop = self.parent.virt2rva(ad_stop)
-
         rva_items = self.parent.drva.get_rvaitem(ad_start, ad_stop, section)
         data_out = pe.data_empty
         for s, n_item in rva_items:
             if s is None:
                 data_out += self.parent.__getitem__(n_item)
             else:
-                data_out += s.data.data.__getitem__(n_item)
-
+                data_out += s.section_data.data.__getitem__(n_item)
         return data_out
 
 class StrTable(object):
@@ -266,13 +272,12 @@ class PE(object):
     Coffhdr = property(lambda self: self.COFFhdr) # Older API
     Doshdr  = property(lambda self: self.DOShdr) # Older API
     def __init__(self, pestr = None,
-                 loadfrommem=False,
                  parse_resources = True,
                  parse_delay = True,
                  parse_reloc = True,
                  wsize = 32):
-        self._drva = drva(self)
-        self._virt = virt(self)
+        self._rva = ContentRVA(self)
+        self._virt = ContentVirtual(self)
         if pestr == None:
             self.sex = '<'
             self.wsize = wsize
@@ -323,14 +328,16 @@ class PE(object):
             #self.NThdr.sizeofheapcommit = 0x1000
             #self.NThdr.sizeofheaders = 0x1000
             self.NThdr.numberofrvaandsizes = 0x10
-            self.NThdr.optentries = pe.OptNThdrs(parent=self)
+            self.NThdr.optentries = pe.OptNThdrs(parent=self.NThdr)
+            for _ in range(self.NThdr.numberofrvaandsizes):
+                self.NThdr.optentries.append(pe.OptNThdr(parent=self.NThdr.optentries))
+            self.NThdr._size += self.NThdr.optentries.bytelen
             self.NThdr.CheckSum = 0
 
             self.NTsig.signature = 0x4550
 
         else:
             self._content = StrPatchwork(pestr)
-            self.loadfrommem = loadfrommem
             self.parse_content(parse_resources = parse_resources,
                                parse_delay = parse_delay,
                                parse_reloc = parse_reloc)
@@ -373,10 +380,17 @@ class PE(object):
         of += self.COFFhdr.bytelen
         magic, = struct.unpack('H', self.content[of:of+2])
         self.wsize = (magic>>8)*32
+        if not magic in (0x10b, 0x20b):
+            # e.g. Ange Albertini's d_nonnull.dll d_tiny.dll
+            log.warn('Opthdr magic %#x', magic)
+            self.wsize = 32
         self.Opthdr = {32: pe.Opthdr32, 64: pe.Opthdr64}[self.wsize](parent=self, content=self.content, start=of)
         l = self.Opthdr.bytelen
         self.NThdr = pe.NThdr(parent=self, content=self.content, start=of+l)
         of += self.COFFhdr.sizeofoptionalheader
+        if self.NThdr.numberofrvaandsizes < 13:
+            log.warn('Windows 8 needs at least 13 directories, %d found',
+                self.NThdr.numberofrvaandsizes)
         # Even if the NT header has 64-bit pointers, in 64-bit PE files
         # the Section headers have 32-bit pointers (it is a 32-bit COFF
         # in a 64-bit PE).
@@ -415,8 +429,6 @@ class PE(object):
         self.content.__setitem__(item, data)
 
     def getsectionbyrva(self, rva, section = None):
-        if self.SHList is None:
-            return None
         if section:
             return self.getsectionbyname(section)
         for s in self.SHList.shlist:
@@ -428,16 +440,12 @@ class PE(object):
         return self.getsectionbyrva(self.virt2rva(vad), section)
 
     def getsectionbyoff(self, off):
-        if self.SHList is None:
-            return None
         for s in self.SHList.shlist:
             if s.scnptr <= off < s.scnptr+s.rsize:
                 return s
         return None
 
     def getsectionbyname(self, name):
-        if self.SHList is None:
-            return None
         for s in self.SHList:
             if s.name.strip('\x00') ==  name:
                 return s
@@ -448,19 +456,24 @@ class PE(object):
             # TODO: .obj cannot convert rva2off without knowing the section
             return None
         # Special case rva in header
-        if rva < self.NThdr.sizeofheaders:
+        if not self.has_relocatable_sections() and rva < self.NThdr.sizeofheaders:
             return rva
         s = self.getsectionbyrva(rva, section)
         if s is None:
+            # e.g. Ange Albertini's tinyW7_3264.exe where sizeofheaders is 0
+            # therefore the import table is in no section but not detected as
+            # in the headers.
+            # We use 0x400 because it is the normal size for headers
+            if rva < 0x400:
+                return rva
             return None
-        soff = (s.scnptr//self.NThdr.filealignment)*self.NThdr.filealignment
-        return rva-s.vaddr+soff
+        return rva-s.vaddr+s.scn_baseoff
 
     def off2rva(self, off):
         s = self.getsectionbyoff(off)
         if s is None:
             return None
-        return off-s.scnptr+s.vaddr
+        return off-s.scn_baseoff+s.vaddr
 
     def virt2rva(self, virt):
         if virt is None or not hasattr(self, 'NThdr'):
@@ -487,22 +500,16 @@ class PE(object):
                 return True
         return False
 
-    def get_drva(self):
-        return self._drva
-
-    drva = property(get_drva)
-
-    def get_virt(self):
-        return self._virt
-
-    virt = property(get_virt)
+    drva = property(lambda _: _._rva) # Deprecated
+    rva = property(lambda _: _._rva)
+    virt = property(lambda _: _._virt)
 
     def patch_crc(self, c, olds):
         s = 0
         data = c[:]
         l = len(data)
         if len(c)%2:
-            end = struct.unpack('B', data[-1])[0]
+            end = struct.unpack('B', data[-1:])[0]
             data = data[:-1]
         if (len(c)&~0x1)%4:
             s+=struct.unpack('H', data[:2])[0]
@@ -568,7 +575,7 @@ class PE(object):
                 log.warn("section %s offset %#x overlap previous section",
                     s.name, s.scnptr)
             off = s.scnptr+s.rawsize
-            c[s.scnptr:off] = s.data.data.pack()
+            c[s.scnptr:off] = s.section_data.data.pack()
 
         # symbols and strings
         if self.COFFhdr.numberofsymbols:
@@ -599,10 +606,6 @@ class PE(object):
         return self.build_content()
 
     def export_funcs(self):
-        if self.DirExport is None:
-            print('no export dir found')
-            return None, None
-
         all_func = {}
         for i, n in enumerate(self.DirExport.f_names):
             all_func[n.name.name] = self.rva2virt(self.DirExport.f_address[self.DirExport.f_nameordinals[i].ordinal].rva)
@@ -611,9 +614,8 @@ class PE(object):
         return all_func
 
     def reloc_to(self, imgbase):
+        DEPRECATED
         offset = imgbase - self.NThdr.ImageBase
-        if self.DirReloc is None:
-            log.warn('no relocation found!')
         for rel in self.DirReloc.reldesc:
             rva = rel.rva
             for reloc in rel.rels:
@@ -755,79 +757,3 @@ class Coff(PE):
                 pe.constants['IMAGE_FILE_MACHINE'].get(
                       self.COFFhdr.machine, '%#x'%self.COFFhdr.machine))
             log.warn('%r', self.Opthdr)
-
-
-if __name__ == "__main__":
-    import rlcompleter,readline,pdb, sys
-    from pprint import pprint as pp
-    readline.parse_and_bind("tab: complete")
-
-    data = open(sys.argv[1]).read()
-    print("Read file of len %d"%len(data))
-    e = PE(data)
-    # Packed file is not identical :-(
-    # Are missing:
-    # - the data between the end of DOS header and the start of PE header
-    # - the padding after the list of sections, before the first section
-    # - many parts of directories
-    e_str = e.pack()
-    print("Packed file of len %d"%len(e_str))
-    open('out.packed.bin', 'wb').write(e_str)
-
-    # Remove Bound Import directory
-    # Usually, its content is not stored in any section... that's
-    # a future version of elfesteem will need to manage this
-    # specific directory in a specific way.
-    e.NThdr.optentries[pe.DIRECTORY_ENTRY_BOUND_IMPORT].rva = 0
-    e.NThdr.optentries[pe.DIRECTORY_ENTRY_BOUND_IMPORT].size = 0
-
-    # Create new sections with all zero content
-    s_redir = e.SHList.add_section(name = "redir", size = 0x1000)
-    s_test  = e.SHList.add_section(name = "test",  size = 0x1000)
-    s_rel   = e.SHList.add_section(name = "rel",   size = 0x5000)
-    e_str = e.pack()
-    open('out.sect.bin', 'wb').write(e_str)
-    print("WROTE out.sect.bin with added sections")
-
-    e = PE(data)
-    # Delete the last sections => OK
-    for _ in range(2):
-        del e.SHList._array[-1]
-        e.SHList._size -= 40
-        e.COFFhdr.numberofsections -= 1
-    # Add two Descriptors in the Import Directory
-    e.DirImport.add_dlldesc(
-              [({"name":"kernel32.dll",
-                 "firstthunk":s_test.vaddr},
-                ["CreateFileA",
-                 "SetFilePointer",
-                 "WriteFile",
-                 "CloseHandle",
-                 ]
-                ),
-               ({"name":"USER32.dll",
-                 "firstthunk":None},
-                ["SetDlgItemInt",
-                 "GetMenu",
-                 "HideCaret",
-                 ]
-                )
-               ]
-              )
-    e_str = e.pack()
-    open('out.import.bin', 'wb').write(e_str)
-    print("WROTE out.import.bin with new imports")
-
-    print("f0 %s" % e.DirImport.get_funcvirt('ExitProcess'))
-    print("f1 %s" % e.DirImport.get_funcvirt('LoadStringW'))
-    print("f2 %s" % e.DirExport.get_funcvirt('SetUserGeoID'))
-
-    if e.DirExport.expdesc is None:
-        e.DirExport.create(['coco'])
-
-    e_str = e.pack()
-    open('out.export.bin', 'wb').write(e_str)
-    print("WROTE out.export.bin with new exports")
-
-    f = PE()
-    open('uu.bin', 'wb').write(f.pack())
