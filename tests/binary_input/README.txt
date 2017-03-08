@@ -14,6 +14,10 @@ notle-tesla-dsp.xe64T
     Source https://drive.google.com/drive/folders/0B2AlG69ZVaWldU1vUnRFUklCek0
     Linked from https://github.com/radare/radare2/issues/1602
 
+ducati-m3_p768.bin
+    Source https://drive.google.com/drive/folders/0B2AlG69ZVaWldU1vUnRFUklCek0
+    Linked from https://github.com/radare/radare2/issues/1602
+
 coff_mingw.obj
 elf64_small.o
 elf64_small.out
