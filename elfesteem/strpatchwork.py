@@ -76,4 +76,3 @@ class StrPatchwork(object):
         if not self.s_cache:
             self.s_cache = self.s.tostring()
         return self.s_cache.rfind(pattern, *args)
-
