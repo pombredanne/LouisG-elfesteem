@@ -1,3 +1,7 @@
+# Important: migration #
+The main repository for elfesteem has migrated from bitbucket to github.
+Therefore, this repository is deprecated, and replaced by https://github.com/LRGH/elfesteem
+
 # Why this fork? #
 
 * Adding Mach-O support
